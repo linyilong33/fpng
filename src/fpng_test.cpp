@@ -1209,32 +1209,46 @@ int main(int arg_c, char **arg_v)
 		convert_to_grayscale(pSource_image_buffer, source_width, source_height, 4, grayscale_image);
 
 		if (!csv_flag)
-			printf("\n** Grayscale Mode Test **\n");
-		printf("Converted image to grayscale: %u x %u\n", source_width, source_height);
+			printf("\n** Grayscale Mode Performance Test **\n");
+		printf("Converted image to grayscale: %u x %u, %u bytes\n", source_width, source_height, (uint32_t)grayscale_image.size());
 
-		// Encode grayscale image with FPNG
+		const uint32_t NUM_TIMES_TO_ENCODE = 3;
+		interval_timer tm;
+		uint32_t total_gray_pixels = source_width * source_height;
+
+		if (!csv_flag)
+			printf("\n** Encoding:\n");
+
+		// ===== FPNG Grayscale Encoding and Writing =====
 		std::vector<uint8_t> fpng_gray_buf;
-		interval_timer tm_gray;
+		double fpng_gray_encode_best_time = 1e+9f;
+		double fpng_gray_write_best_time = 1e+9f;
 
-		tm_gray.start();
-		if (!fpng::fpng_encode_image_to_memory(grayscale_image.data(), source_width, source_height, 1, fpng_gray_buf, fpng_flags))
+		for (uint32_t i = 0; i < NUM_TIMES_TO_ENCODE; i++)
 		{
-			fprintf(stderr, "fpng_encode_image_to_memory() failed for grayscale!\n");
-			return EXIT_FAILURE;
+			tm.start();
+			if (!fpng::fpng_encode_image_to_memory(grayscale_image.data(), source_width, source_height, 1, fpng_gray_buf, fpng_flags))
+			{
+				fprintf(stderr, "fpng_encode_image_to_memory() failed for grayscale!\n");
+				return EXIT_FAILURE;
+			}
+			fpng_gray_encode_best_time = minimum(fpng_gray_encode_best_time, tm.get_elapsed_secs());
 		}
-		double gray_encode_time = tm_gray.get_elapsed_secs();
 
-		printf("FPNG Grayscale: %4.6f secs, %u bytes, %4.3f MB\n", gray_encode_time, (uint32_t)fpng_gray_buf.size(), fpng_gray_buf.size() / (1024.0f * 1024.0f));
-
-		// Save grayscale PNG
+		tm.start();
 		if (!write_data_to_file("fpng_grayscale.png", fpng_gray_buf.data(), fpng_gray_buf.size()))
 		{
 			fprintf(stderr, "Failed writing to file fpng_grayscale.png\n");
 			return EXIT_FAILURE;
 		}
-		printf("Wrote fpng_grayscale.png\n");
+		fpng_gray_write_best_time = tm.get_elapsed_secs();
 
-		// Also convert and save with lodepng for comparison
+		if (!csv_flag)
+			printf("FPNG:    %4.6f secs (enc), %4.6f secs (write), %u bytes, %4.3f MB, %4.3f MP/sec\n", 
+				fpng_gray_encode_best_time, fpng_gray_write_best_time, (uint32_t)fpng_gray_buf.size(), 
+				fpng_gray_buf.size() / (1024.0f * 1024.0f), total_gray_pixels / (1024.0f * 1024.0f) / fpng_gray_encode_best_time);
+
+		// ===== lodepng Grayscale Encoding and Writing =====
 		uint8_vec grayscale_rgba(source_width * source_height * 4);
 		for (uint32_t i = 0; i < source_width * source_height; i++)
 		{
@@ -1245,24 +1259,130 @@ int main(int arg_c, char **arg_v)
 		}
 
 		uint8_vec lodepng_gray_buf;
-		double lodepng_gray_time = 0;
-		interval_timer tm_lodepng;
+		double lodepng_gray_encode_best_time = 1e+9f;
+		double lodepng_gray_write_best_time = 1e+9f;
 
-		tm_lodepng.start();
-		lodepng::encode(lodepng_gray_buf, grayscale_rgba.data(), source_width, source_height, LCT_RGBA, 8);
-		lodepng_gray_time = tm_lodepng.get_elapsed_secs();
+		for (uint32_t i = 0; i < NUM_TIMES_TO_ENCODE; i++)
+		{
+			tm.start();
+			lodepng_gray_buf.resize(0);
+			error = lodepng::encode(lodepng_gray_buf, grayscale_rgba.data(), source_width, source_height, LCT_RGBA, 8);
+			lodepng_gray_encode_best_time = minimum(lodepng_gray_encode_best_time, tm.get_elapsed_secs());
 
-		printf("lodepng Grayscale: %4.6f secs, %u bytes, %4.3f MB\n", lodepng_gray_time, (uint32_t)lodepng_gray_buf.size(), lodepng_gray_buf.size() / (1024.0f * 1024.0f));
+			if (error != 0)
+			{
+				fprintf(stderr, "lodepng::encode() failed for grayscale!\n");
+				return EXIT_FAILURE;
+			}
+		}
 
+		tm.start();
 		if (!write_data_to_file("lodepng_grayscale.png", lodepng_gray_buf.data(), lodepng_gray_buf.size()))
 		{
 			fprintf(stderr, "Failed writing to file lodepng_grayscale.png\n");
 			return EXIT_FAILURE;
 		}
-		printf("Wrote lodepng_grayscale.png\n");
+		lodepng_gray_write_best_time = tm.get_elapsed_secs();
 
-		printf("\nComparison:\n");
-		printf("FPNG is %.2f%% smaller than lodepng\n", (1.0f - (float)fpng_gray_buf.size() / (float)lodepng_gray_buf.size()) * 100.0f);
+		if (!csv_flag)
+			printf("lodepng: %4.6f secs (enc), %4.6f secs (write), %u bytes, %4.3f MB, %4.3f MP/sec\n", 
+				lodepng_gray_encode_best_time, lodepng_gray_write_best_time, (uint32_t)lodepng_gray_buf.size(), 
+				lodepng_gray_buf.size() / (1024.0f * 1024.0f), total_gray_pixels / (1024.0f * 1024.0f) / lodepng_gray_encode_best_time);
+
+		// ===== stbi_image_write Grayscale Encoding and Writing =====
+		uint8_vec stbi_gray_buf;
+		stbi_gray_buf.reserve(total_gray_pixels);
+		double stbi_gray_encode_best_time = 1e+9f;
+		double stbi_gray_write_best_time = 1e+9f;
+
+		for (uint32_t i = 0; i < NUM_TIMES_TO_ENCODE; i++)
+		{
+			stbi_gray_buf.resize(0);
+			tm.start();
+			int res = stbi_write_png_to_func(write_func_stbi, &stbi_gray_buf, source_width, source_height, 1, grayscale_image.data(), source_width);
+			if (!res)
+			{
+				fprintf(stderr, "stbi_write_png_to_func() failed for grayscale!\n");
+				return EXIT_FAILURE;
+			}
+			stbi_gray_encode_best_time = minimum(stbi_gray_encode_best_time, tm.get_elapsed_secs());
+		}
+
+		tm.start();
+		if (!write_data_to_file("stbi_grayscale.png", stbi_gray_buf.data(), stbi_gray_buf.size()))
+		{
+			fprintf(stderr, "Failed writing to file stbi_grayscale.png\n");
+			return EXIT_FAILURE;
+		}
+		stbi_gray_write_best_time = tm.get_elapsed_secs();
+
+		if (!csv_flag)
+			printf("stbi:    %4.6f secs (enc), %4.6f secs (write), %u bytes, %4.3f MB, %4.3f MP/sec\n", 
+				stbi_gray_encode_best_time, stbi_gray_write_best_time, (uint32_t)stbi_gray_buf.size(), 
+				stbi_gray_buf.size() / (1024.0f * 1024.0f), total_gray_pixels / (1024.0f * 1024.0f) / stbi_gray_encode_best_time);
+
+		// ===== QOI Grayscale Encoding and Writing =====
+		qoi_desc qdesc_gray;
+		qdesc_gray.channels = 1;
+		qdesc_gray.width = source_width;
+		qdesc_gray.height = source_height;
+		qdesc_gray.colorspace = QOI_SRGB;
+
+		int qoi_gray_len = 0;
+		void* pQOI_gray_data = nullptr;
+		double qoi_gray_encode_best_time = 1e+9f;
+		double qoi_gray_write_best_time = 1e+9f;
+
+		for (uint32_t i = 0; i < NUM_TIMES_TO_ENCODE; i++)
+		{
+			if (pQOI_gray_data)
+				free(pQOI_gray_data);
+
+			tm.start();
+			pQOI_gray_data = qoi_encode(grayscale_image.data(), &qdesc_gray, &qoi_gray_len);
+			qoi_gray_encode_best_time = minimum(qoi_gray_encode_best_time, tm.get_elapsed_secs());
+		}
+
+		tm.start();
+		if (!write_data_to_file("qoi_grayscale.qoi", pQOI_gray_data, qoi_gray_len))
+		{
+			fprintf(stderr, "Failed writing to file qoi_grayscale.qoi\n");
+			return EXIT_FAILURE;
+		}
+		qoi_gray_write_best_time = tm.get_elapsed_secs();
+
+		if (!csv_flag)
+			printf("qoi:     %4.6f secs (enc), %4.6f secs (write), %i bytes, %4.3f MB, %4.3f MP/sec\n", 
+				qoi_gray_encode_best_time, qoi_gray_write_best_time, qoi_gray_len, 
+				(double)qoi_gray_len / (1024.0f * 1024.0f), total_gray_pixels / (1024.0f * 1024.0f) / qoi_gray_encode_best_time);
+
+		// ===== Performance Summary =====
+		if (!csv_flag)
+		{
+			printf("\n** Grayscale Compression Comparison (File Size) **\n");
+			printf("FPNG vs lodepng: %.2f%% smaller\n", (1.0f - (float)fpng_gray_buf.size() / (float)lodepng_gray_buf.size()) * 100.0f);
+			printf("FPNG vs stbi:    %.2f%% smaller\n", (1.0f - (float)fpng_gray_buf.size() / (float)stbi_gray_buf.size()) * 100.0f);
+			printf("FPNG vs qoi:     %.2f%% %s\n", 
+				(fpng_gray_buf.size() < qoi_gray_len) ? 
+					(1.0f - (float)fpng_gray_buf.size() / qoi_gray_len) * 100.0f :
+					((float)qoi_gray_len / fpng_gray_buf.size() - 1.0f) * 100.0f,
+				(fpng_gray_buf.size() < qoi_gray_len) ? "smaller" : "larger");
+
+			printf("\n** Total Time (Encoding + Writing) **\n");
+			printf("FPNG:    %4.6f secs\n", fpng_gray_encode_best_time + fpng_gray_write_best_time);
+			printf("lodepng: %4.6f secs\n", lodepng_gray_encode_best_time + lodepng_gray_write_best_time);
+			printf("stbi:    %4.6f secs\n", stbi_gray_encode_best_time + stbi_gray_write_best_time);
+			printf("qoi:     %4.6f secs\n", qoi_gray_encode_best_time + qoi_gray_write_best_time);
+
+			printf("\n** File Sizes Summary **\n");
+			printf("FPNG:    %u bytes (%.3f MB)\n", (uint32_t)fpng_gray_buf.size(), fpng_gray_buf.size() / (1024.0f * 1024.0f));
+			printf("lodepng: %u bytes (%.3f MB)\n", (uint32_t)lodepng_gray_buf.size(), lodepng_gray_buf.size() / (1024.0f * 1024.0f));
+			printf("stbi:    %u bytes (%.3f MB)\n", (uint32_t)stbi_gray_buf.size(), stbi_gray_buf.size() / (1024.0f * 1024.0f));
+			printf("qoi:     %i bytes (%.3f MB)\n", qoi_gray_len, (double)qoi_gray_len / (1024.0f * 1024.0f));
+		}
+
+		free(pQOI_gray_data);
+		pQOI_gray_data = nullptr;
 
 		return EXIT_SUCCESS;
 	}
