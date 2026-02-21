@@ -2265,6 +2265,8 @@ do_literals:
 	bit_buf_size -= l; \
 	} while(0)
 
+
+
 	static bool prepare_dynamic_block(
 		const uint8_t* pSrc, uint32_t src_len, uint32_t& src_ofs,
 		uint32_t& bit_buf_size, uint64_t& bit_buf,
@@ -2414,6 +2416,182 @@ do_literals:
 
 			pLit_table[i] |= (next_sym << 16) | (next_sym_bits << (16 + 9));
 		}
+
+		return true;
+	}
+
+	// Grayscale (1-channel) decompression
+	template<uint32_t dst_comps>
+	static bool fpng_pixel_zlib_decompress_1(
+		const uint8_t* pSrc, uint32_t src_len, uint32_t zlib_len,
+		uint8_t* pDst, uint32_t w, uint32_t h)
+	{
+		assert(src_len >= (zlib_len + 4));
+
+		const uint32_t dst_bpl = w * dst_comps;
+
+		if (zlib_len < 7)
+			return false;
+
+		// check zlib header
+		if ((pSrc[0] != 0x78) || (pSrc[1] != 0x01))
+			return false;
+
+		uint32_t src_ofs = 2;
+
+		if ((pSrc[src_ofs] & 6) == 0)
+		{
+			// Raw blocks not supported for grayscale yet
+			return false;
+		}
+
+		if ((src_ofs + 4) > src_len)
+			return false;
+		uint64_t bit_buf = READ_LE32(pSrc + src_ofs);
+		src_ofs += 4;
+
+		uint32_t bit_buf_size = 32;
+
+		uint32_t bfinal, btype;
+		GET_BITS(bfinal, 1);
+		GET_BITS(btype, 2);
+
+		// Must be the final block or it's not valid, and type=2 (dynamic)
+		if ((bfinal != 1) || (btype != 2))
+			return false;
+
+		uint32_t lit_table[FPNG_DECODER_TABLE_SIZE];
+		if (!prepare_dynamic_block(pSrc, src_len, src_ofs, bit_buf_size, bit_buf, lit_table, 1))
+			return false;
+
+		const uint8_t* pPrev_scanline = nullptr;
+		uint8_t* pCur_scanline = pDst;
+
+		for (uint32_t y = 0; y < h; y++)
+		{
+			// At start of PNG scanline, so read the filter literal
+			assert(bit_buf_size >= FPNG_DECODER_TABLE_BITS);
+			uint32_t filter = lit_table[bit_buf & (FPNG_DECODER_TABLE_SIZE - 1)];
+			uint32_t filter_len = (filter >> 9) & 15;
+			if (!filter_len)
+				return false;
+			SKIP_BITS(filter_len);
+			filter &= 511;
+
+			uint32_t expected_filter = (y ? 2 : 0);
+			if (filter != expected_filter)
+				return false;
+
+			uint32_t x_ofs = 0;
+			uint8_t prev_delta = 0;
+			do
+			{
+				assert(bit_buf_size >= FPNG_DECODER_TABLE_BITS);
+				uint32_t lit_tab = lit_table[bit_buf & (FPNG_DECODER_TABLE_SIZE - 1)];
+
+				uint32_t lit = lit_tab;
+				uint32_t lit_len = (lit_tab >> 9) & 15;
+				if (!lit_len)
+					return false;
+				SKIP_BITS(lit_len);
+
+				if (lit & 256)
+				{
+					lit &= 511;
+
+					// Can't be EOB
+					if (lit == 256)
+						return false;
+
+					// Must be an RLE match against the previous pixel
+					uint32_t run_len = s_length_range[lit - 257];
+					if (lit >= 265)
+					{
+						uint32_t e;
+						GET_BITS_NE(e, s_length_extra[lit - 257]);
+						run_len += e;
+					}
+
+					// Skip match distance - it's always 1 for grayscale
+					SKIP_BITS_NE(1);
+
+					const uint32_t x_ofs_end = x_ofs + run_len;
+
+					// Matches cannot cross scanlines
+					if (x_ofs_end > dst_bpl)
+						return false;
+
+					if (pPrev_scanline)
+					{
+						if (prev_delta == 0)
+						{
+							memcpy(pCur_scanline + x_ofs, pPrev_scanline + x_ofs, run_len);
+							x_ofs = x_ofs_end;
+						}
+						else
+						{
+							do
+							{
+								pCur_scanline[x_ofs] = (uint8_t)(pPrev_scanline[x_ofs] + prev_delta);
+								x_ofs++;
+							} while (x_ofs < x_ofs_end);
+						}
+					}
+					else
+					{
+						do
+						{
+							pCur_scanline[x_ofs] = prev_delta;
+							x_ofs++;
+						} while (x_ofs < x_ofs_end);
+					}
+				}
+				else
+				{
+					// Literal byte
+					if (pPrev_scanline)
+					{
+						pCur_scanline[x_ofs] = (uint8_t)(pPrev_scanline[x_ofs] + lit);
+					}
+					else
+					{
+						pCur_scanline[x_ofs] = (uint8_t)lit;
+					}
+
+					prev_delta = (uint8_t)lit;
+					x_ofs++;
+				}
+
+			} while (x_ofs < dst_bpl);
+
+			pPrev_scanline = pCur_scanline;
+			pCur_scanline += dst_bpl;
+		} // y
+
+		// The last symbol should be EOB
+		assert(bit_buf_size >= FPNG_DECODER_TABLE_BITS);
+		uint32_t lit = lit_table[bit_buf & (FPNG_DECODER_TABLE_SIZE - 1)];
+		uint32_t lit_len = (lit >> 9) & 15;
+		if (!lit_len)
+			return false;
+		lit &= 511;
+		if (lit != 256)
+			return false;
+
+		bit_buf_size -= lit_len;
+		bit_buf >>= lit_len;
+
+		uint32_t align_bits = bit_buf_size & 7;
+		bit_buf_size -= align_bits;
+		bit_buf >>= align_bits;
+
+		if (src_ofs < (bit_buf_size >> 3))
+			return false;
+		src_ofs -= (bit_buf_size >> 3);
+
+		// Check we're at the end
+		if ((src_ofs + 4) != zlib_len)
+			return false;
 
 		return true;
 	}
@@ -3287,7 +3465,9 @@ do_literals:
 		if ((ihdr.m_comp_method) || (ihdr.m_filter_method) || (ihdr.m_interlace_method) || (ihdr.m_bitdepth != 8))
 			return FPNG_DECODE_NOT_FPNG;
 
-		if (ihdr.m_color_type == 2)
+		if (ihdr.m_color_type == 0)
+			channels_in_file = 1;
+		else if (ihdr.m_color_type == 2)
 			channels_in_file = 3;
 		else if (ihdr.m_color_type == 6)
 			channels_in_file = 4;
@@ -3428,7 +3608,14 @@ do_literals:
 		const uint32_t src_len = image_size - (idat_ofs + sizeof(uint32_t) * 2);
 
 		bool decomp_status;
-		if (desired_channels == 3)
+		if (channels_in_file == 1)
+		{
+			//if (desired_channels == 1)
+				decomp_status = fpng_pixel_zlib_decompress_1<1>(pIDAT_data, src_len, idat_len, out.data(), width, height);
+			//else
+			//	decomp_status = fpng_pixel_zlib_decompress_1<4>(pIDAT_data, src_len, idat_len, out.data(), width, height);
+		}
+		else if (desired_channels == 3)
 		{
 			if (channels_in_file == 3)
 				decomp_status = fpng_pixel_zlib_decompress_3<3>(pIDAT_data, src_len, idat_len, out.data(), width, height);

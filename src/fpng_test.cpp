@@ -990,6 +990,175 @@ static void convert_to_grayscale(const uint8_t* pSource, uint32_t w, uint32_t h,
 	}
 }
 
+// Decode performance test
+static int decode_performance_test(const char* pFilename)
+{
+	uint8_vec source_file_data;
+	if (!read_file_to_vec(pFilename, source_file_data))
+	{
+		fprintf(stderr, "Failed reading PNG file \"%s\"\n", pFilename);
+		return EXIT_FAILURE;
+	}
+
+	printf("** Decode Performance Test **\n");
+	printf("File: %s, Size: %u bytes (%.3f MB)\n\n", pFilename, (uint32_t)source_file_data.size(), source_file_data.size() / (1024.0f * 1024.0f));
+
+	uint32_t width = 0, height = 0, channels_in_file = 0;
+	int res = fpng::fpng_get_info(source_file_data.data(), (uint32_t)source_file_data.size(), width, height, channels_in_file);
+
+	if (res != fpng::FPNG_DECODE_SUCCESS)
+	{
+		fprintf(stderr, "Failed to get PNG info!\n");
+		return EXIT_FAILURE;
+	}
+
+	printf("Image: %u x %u, Channels: %u, Total Pixels: %u\n\n", width, height, channels_in_file, width * height);
+
+	const uint32_t NUM_DECODE_ITERATIONS = 5;
+	const uint32_t total_pixels = width * height;
+	interval_timer tm;
+
+	// FPNG decode test
+	printf("** FPNG Decoder **\n");
+	double fpng_decode_time = 1e+9f;
+	std::vector<uint8_t> fpng_decoded_buf;
+
+	for (uint32_t i = 0; i < NUM_DECODE_ITERATIONS; i++)
+	{
+		fpng_decoded_buf.clear();
+		uint32_t dec_width, dec_height, dec_channels;
+
+		tm.start();
+		res = fpng::fpng_decode_memory(source_file_data.data(), (uint32_t)source_file_data.size(), fpng_decoded_buf, dec_width, dec_height, dec_channels,4);
+		fpng_decode_time = minimum(fpng_decode_time, tm.get_elapsed_secs());
+
+		if (res != fpng::FPNG_DECODE_SUCCESS)
+		{
+			fprintf(stderr, "FPNG decode failed with error %d!\n", res);
+			return EXIT_FAILURE;
+		}
+	}
+
+	printf("Best time: %4.6f secs\n", fpng_decode_time);
+	printf("Throughput: %4.3f MP/sec\n", (total_pixels / (1024.0f * 1024.0f)) / fpng_decode_time);
+	printf("Output: %u bytes (%.3f MB)\n\n", (uint32_t)fpng_decoded_buf.size(), fpng_decoded_buf.size() / (1024.0f * 1024.0f));
+
+	// lodepng decode test
+	printf("** lodepng Decoder **\n");
+	double lodepng_decode_time = 1e+9f;
+	uint8_t* pLodepng_decoded = nullptr;
+
+	for (uint32_t i = 0; i < NUM_DECODE_ITERATIONS; i++)
+	{
+		if (pLodepng_decoded)
+			free(pLodepng_decoded);
+
+		uint32_t dec_width, dec_height;
+
+		tm.start();
+		unsigned int error = lodepng_decode_memory(&pLodepng_decoded, &dec_width, &dec_height, 
+			source_file_data.data(), source_file_data.size(), LCT_RGBA, 8);
+		lodepng_decode_time = minimum(lodepng_decode_time, tm.get_elapsed_secs());
+
+		if (error != 0)
+		{
+			fprintf(stderr, "lodepng decode failed with error %u!\n", error);
+			return EXIT_FAILURE;
+		}
+	}
+
+	printf("Best time: %4.6f secs\n", lodepng_decode_time);
+	printf("Throughput: %4.3f MP/sec\n", (total_pixels / (1024.0f * 1024.0f)) / lodepng_decode_time);
+	printf("Output: %u bytes (%.3f MB)\n\n", (uint32_t)(width * height * 4), (width * height * 4) / (1024.0f * 1024.0f));
+
+	// stb_image decode test
+	printf("** stb_image Decoder **\n");
+	double stbi_decode_time = 1e+9f;
+	void* pStbi_decoded = nullptr;
+
+	for (uint32_t i = 0; i < NUM_DECODE_ITERATIONS; i++)
+	{
+		if (pStbi_decoded)
+			free(pStbi_decoded);
+
+		int x, y, c;
+
+		tm.start();
+		pStbi_decoded = stbi_load_from_memory(source_file_data.data(), (int)source_file_data.size(), &x, &y, &c, 4);
+		stbi_decode_time = minimum(stbi_decode_time, tm.get_elapsed_secs());
+
+		if (!pStbi_decoded)
+		{
+			fprintf(stderr, "stbi_load_from_memory() failed!\n");
+			return EXIT_FAILURE;
+		}
+	}
+
+	printf("Best time: %4.6f secs\n", stbi_decode_time);
+	printf("Throughput: %4.3f MP/sec\n", (total_pixels / (1024.0f * 1024.0f)) / stbi_decode_time);
+	printf("Output: %u bytes (%.3f MB)\n\n", (uint32_t)(width * height * 4), (width * height * 4) / (1024.0f * 1024.0f));
+
+	// wuffs decode test
+	printf("** wuffs Decoder **\n");
+	double wuffs_decode_time = 1e+9f;
+	void* pWuffs_decoded = nullptr;
+
+	for (uint32_t i = 0; i < NUM_DECODE_ITERATIONS; i++)
+	{
+		if (pWuffs_decoded)
+			free(pWuffs_decoded);
+
+		uint32_t dec_width, dec_height;
+
+		tm.start();
+		pWuffs_decoded = wuffs_decode(source_file_data.data(), source_file_data.size(), dec_width, dec_height);
+		wuffs_decode_time = minimum(wuffs_decode_time, tm.get_elapsed_secs());
+
+		if (!pWuffs_decoded)
+		{
+			fprintf(stderr, "wuffs_decode() failed!\n");
+			return EXIT_FAILURE;
+		}
+	}
+
+	printf("Best time: %4.6f secs\n", wuffs_decode_time);
+	printf("Throughput: %4.3f MP/sec\n", (total_pixels / (1024.0f * 1024.0f)) / wuffs_decode_time);
+	printf("Output: %u bytes (%.3f MB)\n\n", (uint32_t)(width * height * 4), (width * height * 4) / (1024.0f * 1024.0f));
+
+	// Performance comparison summary
+	printf("** Decode Performance Summary **\n");
+	printf("FPNG:    %3.6f secs, %4.3f MP/sec\n", fpng_decode_time, (total_pixels / (1024.0f * 1024.0f)) / fpng_decode_time);
+	printf("lodepng: %3.6f secs, %4.3f MP/sec\n", lodepng_decode_time, (total_pixels / (1024.0f * 1024.0f)) / lodepng_decode_time);
+	printf("stbi:    %3.6f secs, %4.3f MP/sec\n", stbi_decode_time, (total_pixels / (1024.0f * 1024.0f)) / stbi_decode_time);
+	printf("wuffs:   %3.6f secs, %4.3f MP/sec\n", wuffs_decode_time, (total_pixels / (1024.0f * 1024.0f)) / wuffs_decode_time);
+
+	printf("\n** Relative Performance (vs FPNG) **\n");
+	printf("lodepng: %.2f%% %s\n", 
+		(lodepng_decode_time > fpng_decode_time) ? 
+			(lodepng_decode_time / fpng_decode_time - 1.0f) * 100.0f :
+			(1.0f - fpng_decode_time / lodepng_decode_time) * 100.0f,
+		(lodepng_decode_time > fpng_decode_time) ? "slower" : "faster");
+
+	printf("stbi:    %.2f%% %s\n", 
+		(stbi_decode_time > fpng_decode_time) ? 
+			(stbi_decode_time / fpng_decode_time - 1.0f) * 100.0f :
+			(1.0f - fpng_decode_time / stbi_decode_time) * 100.0f,
+		(stbi_decode_time > fpng_decode_time) ? "slower" : "faster");
+
+	printf("wuffs:   %.2f%% %s\n", 
+		(wuffs_decode_time > fpng_decode_time) ? 
+			(wuffs_decode_time / fpng_decode_time - 1.0f) * 100.0f :
+			(1.0f - fpng_decode_time / wuffs_decode_time) * 100.0f,
+		(wuffs_decode_time > fpng_decode_time) ? "slower" : "faster");
+
+	// Cleanup
+	free(pLodepng_decoded);
+	free(pStbi_decoded);
+	free(pWuffs_decoded);
+
+	return EXIT_SUCCESS;
+}
+
 int main(int arg_c, char **arg_v)
 {
 	fpng::fpng_init();
@@ -1007,6 +1176,7 @@ int main(int arg_c, char **arg_v)
 		printf("-f: Decompress specified PNG image using FPNG, then exit\n");
 		printf("-a: Swizzle input image's green to alpha, for testing 32bpp correlation alpha\n");
 		printf("-g: Convert image to grayscale and test grayscale compression\n");
+		printf("-d: Decode performance test - test decoding performance with multiple decoders\n");
 		printf("-t: Train Huffman tables on @filelist.txt (must compile with FPNG_TRAIN_HUFFMAN_TABLES=1)\n");
 		return EXIT_FAILURE;
 	}
@@ -1021,6 +1191,7 @@ int main(int arg_c, char **arg_v)
 	bool fuzz_decoder = false;
 	bool swizzle_green_to_alpha = false;
 	bool grayscale_mode = false;
+	bool decode_perf_mode = false;
 	bool training_mode_flag = false;
 
 	for (int i = 1; i < arg_c; i++)
@@ -1060,6 +1231,10 @@ int main(int arg_c, char **arg_v)
 			{
 				grayscale_mode = true;
 			}
+			else if (pArg[1] == 'd')
+			{
+				decode_perf_mode = true;
+			}
 			else if (pArg[1] == 't')
 			{
 				training_mode_flag = true;
@@ -1096,6 +1271,9 @@ int main(int arg_c, char **arg_v)
 
 	if (training_mode_flag)
 		return training_mode(pFilename);
+
+	if (decode_perf_mode)
+		return decode_performance_test(pFilename);
 
 	if (!csv_flag)
 	{
@@ -1207,7 +1385,7 @@ int main(int arg_c, char **arg_v)
 	{
 		uint8_vec grayscale_image;
 		convert_to_grayscale(pSource_image_buffer, source_width, source_height, 4, grayscale_image);
-
+ 
 		if (!csv_flag)
 			printf("\n** Grayscale Mode Performance Test **\n");
 		printf("Converted image to grayscale: %u x %u, %u bytes\n", source_width, source_height, (uint32_t)grayscale_image.size());
@@ -1379,6 +1557,66 @@ int main(int arg_c, char **arg_v)
 			printf("lodepng: %u bytes (%.3f MB)\n", (uint32_t)lodepng_gray_buf.size(), lodepng_gray_buf.size() / (1024.0f * 1024.0f));
 			printf("stbi:    %u bytes (%.3f MB)\n", (uint32_t)stbi_gray_buf.size(), stbi_gray_buf.size() / (1024.0f * 1024.0f));
 			printf("qoi:     %i bytes (%.3f MB)\n", qoi_gray_len, (double)qoi_gray_len / (1024.0f * 1024.0f));
+
+			// Decode test for FPNG grayscale
+			printf("\n** Grayscale Decode Test **\n");
+			std::vector<uint8_t> fpng_decoded_gray;
+			uint32_t decode_width, decode_height, decode_channels;
+			int decode_res = fpng::fpng_decode_memory(fpng_gray_buf.data(), (uint32_t)fpng_gray_buf.size(), 
+				fpng_decoded_gray, decode_width, decode_height, decode_channels, 1);
+
+			if (decode_res != fpng::FPNG_DECODE_SUCCESS)
+			{
+				fprintf(stderr, "FPNG grayscale decode failed with error %d!\n", decode_res);
+				return EXIT_FAILURE;
+			}
+
+			if ((decode_width != source_width) || (decode_height != source_height) || (decode_channels != 1))
+			{
+				fprintf(stderr, "FPNG grayscale decode returned invalid dimensions\n");
+				return EXIT_FAILURE;
+			}
+
+			if (memcmp(fpng_decoded_gray.data(), grayscale_image.data(), source_width * source_height) != 0)
+			{
+				fprintf(stderr, "FPNG grayscale decode verification failed!\n");
+				return EXIT_FAILURE;
+			}
+
+			printf("FPNG grayscale decode: SUCCESS (%u x %u, 1 channel)\n", decode_width, decode_height);
+
+			// Also test 1->4 channel conversion
+			std::vector<uint8_t> fpng_decoded_gray_rgba;
+			int decode_res_rgba = fpng::fpng_decode_memory(fpng_gray_buf.data(), (uint32_t)fpng_gray_buf.size(), 
+				fpng_decoded_gray_rgba, decode_width, decode_height, decode_channels, 4);
+
+			if (decode_res_rgba != fpng::FPNG_DECODE_SUCCESS)
+			{
+				fprintf(stderr, "FPNG grayscale -> RGBA decode failed with error %d!\n", decode_res_rgba);
+				return EXIT_FAILURE;
+			}
+
+			if ((decode_width != source_width) || (decode_height != source_height) || (decode_channels != 1))
+			{
+				fprintf(stderr, "FPNG grayscale -> RGBA decode returned invalid image info\n");
+				return EXIT_FAILURE;
+			}
+
+			// Verify the RGB values match grayscale and alpha is 0xFF
+			for (uint32_t i = 0; i < source_width * source_height; i++)
+			{
+				uint8_t gray_val = grayscale_image[i];
+				if ((fpng_decoded_gray_rgba[i * 4 + 0] != gray_val) ||
+					(fpng_decoded_gray_rgba[i * 4 + 1] != gray_val) ||
+					(fpng_decoded_gray_rgba[i * 4 + 2] != gray_val) ||
+					(fpng_decoded_gray_rgba[i * 4 + 3] != 0xFF))
+				{
+					fprintf(stderr, "FPNG grayscale -> RGBA decode verification failed at pixel %u!\n", i);
+					return EXIT_FAILURE;
+				}
+			}
+
+			printf("FPNG grayscale -> RGBA decode: SUCCESS (%u x %u, converted to 4 channels)\n", decode_width, decode_height);
 		}
 
 		free(pQOI_gray_data);
