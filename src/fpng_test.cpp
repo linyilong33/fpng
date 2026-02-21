@@ -972,6 +972,24 @@ static int training_mode(const char* pFilename)
 }
 #endif
 
+// Convert RGB/RGBA image to grayscale using standard luminance formula
+static void convert_to_grayscale(const uint8_t* pSource, uint32_t w, uint32_t h, uint32_t source_chans, std::vector<uint8_t>& out_gray)
+{
+	uint32_t total_pixels = w * h;
+	out_gray.resize(w * h);
+
+	for (uint32_t i = 0; i < total_pixels; i++)
+	{
+		uint32_t r = pSource[i * source_chans + 0];
+		uint32_t g = pSource[i * source_chans + 1];
+		uint32_t b = pSource[i * source_chans + 2];
+
+		// Standard luminance formula: Y = 0.299*R + 0.587*G + 0.114*B
+		uint32_t gray = (r * 77 + g * 150 + b * 29) >> 8;
+		out_gray[i] = (uint8_t)gray;
+	}
+}
+
 int main(int arg_c, char **arg_v)
 {
 	fpng::fpng_init();
@@ -988,6 +1006,7 @@ int main(int arg_c, char **arg_v)
 		printf("-e: Fuzz encoder/decoder by randomly modifying an input image's pixels\n");
 		printf("-f: Decompress specified PNG image using FPNG, then exit\n");
 		printf("-a: Swizzle input image's green to alpha, for testing 32bpp correlation alpha\n");
+		printf("-g: Convert image to grayscale and test grayscale compression\n");
 		printf("-t: Train Huffman tables on @filelist.txt (must compile with FPNG_TRAIN_HUFFMAN_TABLES=1)\n");
 		return EXIT_FAILURE;
 	}
@@ -1001,6 +1020,7 @@ int main(int arg_c, char **arg_v)
 	bool fuzz_encoder2 = false;
 	bool fuzz_decoder = false;
 	bool swizzle_green_to_alpha = false;
+	bool grayscale_mode = false;
 	bool training_mode_flag = false;
 
 	for (int i = 1; i < arg_c; i++)
@@ -1035,6 +1055,10 @@ int main(int arg_c, char **arg_v)
 			else if (pArg[1] == 'a')
 			{
 				swizzle_green_to_alpha = true;
+			}
+			else if (pArg[1] == 'g')
+			{
+				grayscale_mode = true;
 			}
 			else if (pArg[1] == 't')
 			{
@@ -1177,7 +1201,72 @@ int main(int arg_c, char **arg_v)
 	}
 
 	const uint8_t* pSource_pixels24 = source_image_buffer24.data();
-	
+
+	// Handle grayscale mode
+	if (grayscale_mode)
+	{
+		uint8_vec grayscale_image;
+		convert_to_grayscale(pSource_image_buffer, source_width, source_height, 4, grayscale_image);
+
+		if (!csv_flag)
+			printf("\n** Grayscale Mode Test **\n");
+		printf("Converted image to grayscale: %u x %u\n", source_width, source_height);
+
+		// Encode grayscale image with FPNG
+		std::vector<uint8_t> fpng_gray_buf;
+		interval_timer tm_gray;
+
+		tm_gray.start();
+		if (!fpng::fpng_encode_image_to_memory(grayscale_image.data(), source_width, source_height, 1, fpng_gray_buf, fpng_flags))
+		{
+			fprintf(stderr, "fpng_encode_image_to_memory() failed for grayscale!\n");
+			return EXIT_FAILURE;
+		}
+		double gray_encode_time = tm_gray.get_elapsed_secs();
+
+		printf("FPNG Grayscale: %4.6f secs, %u bytes, %4.3f MB\n", gray_encode_time, (uint32_t)fpng_gray_buf.size(), fpng_gray_buf.size() / (1024.0f * 1024.0f));
+
+		// Save grayscale PNG
+		if (!write_data_to_file("fpng_grayscale.png", fpng_gray_buf.data(), fpng_gray_buf.size()))
+		{
+			fprintf(stderr, "Failed writing to file fpng_grayscale.png\n");
+			return EXIT_FAILURE;
+		}
+		printf("Wrote fpng_grayscale.png\n");
+
+		// Also convert and save with lodepng for comparison
+		uint8_vec grayscale_rgba(source_width * source_height * 4);
+		for (uint32_t i = 0; i < source_width * source_height; i++)
+		{
+			grayscale_rgba[i * 4 + 0] = grayscale_image[i];
+			grayscale_rgba[i * 4 + 1] = grayscale_image[i];
+			grayscale_rgba[i * 4 + 2] = grayscale_image[i];
+			grayscale_rgba[i * 4 + 3] = 255;
+		}
+
+		uint8_vec lodepng_gray_buf;
+		double lodepng_gray_time = 0;
+		interval_timer tm_lodepng;
+
+		tm_lodepng.start();
+		lodepng::encode(lodepng_gray_buf, grayscale_rgba.data(), source_width, source_height, LCT_RGBA, 8);
+		lodepng_gray_time = tm_lodepng.get_elapsed_secs();
+
+		printf("lodepng Grayscale: %4.6f secs, %u bytes, %4.3f MB\n", lodepng_gray_time, (uint32_t)lodepng_gray_buf.size(), lodepng_gray_buf.size() / (1024.0f * 1024.0f));
+
+		if (!write_data_to_file("lodepng_grayscale.png", lodepng_gray_buf.data(), lodepng_gray_buf.size()))
+		{
+			fprintf(stderr, "Failed writing to file lodepng_grayscale.png\n");
+			return EXIT_FAILURE;
+		}
+		printf("Wrote lodepng_grayscale.png\n");
+
+		printf("\nComparison:\n");
+		printf("FPNG is %.2f%% smaller than lodepng\n", (1.0f - (float)fpng_gray_buf.size() / (float)lodepng_gray_buf.size()) * 100.0f);
+
+		return EXIT_SUCCESS;
+	}
+
 	const uint32_t NUM_TIMES_TO_ENCODE = csv_flag ? 3 : 3;
 	const uint32_t NUM_TIMES_TO_DECODE = 5;
 	interval_timer tm;
