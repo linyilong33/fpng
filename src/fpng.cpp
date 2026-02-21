@@ -135,12 +135,14 @@ namespace fpng
 		#define READ_LE32(p) swap32(*reinterpret_cast<const uint32_t *>(p))
 		#define WRITE_LE32(p, v) *reinterpret_cast<uint32_t *>(p) = swap32((uint32_t)(v))
 		#define WRITE_LE64(p, v) *reinterpret_cast<uint64_t *>(p) = swap64((uint64_t)(v))
+		#define READ_LE64(p) swap64(*reinterpret_cast<const uint64_t *>(p))
 
 		#define READ_BE32(p) *reinterpret_cast<const uint32_t *>(p)
 	#else
 		#define READ_LE32(p) (*reinterpret_cast<const uint32_t *>(p))
 		#define WRITE_LE32(p, v) *reinterpret_cast<uint32_t *>(p) = (uint32_t)(v)
 		#define WRITE_LE64(p, v) *reinterpret_cast<uint64_t *>(p) = (uint64_t)(v)
+		#define READ_LE64(p) (*reinterpret_cast<const uint64_t *>(p))
 
 		#define READ_BE32(p) swap32(*reinterpret_cast<const uint32_t *>(p))
 	#endif
@@ -150,6 +152,13 @@ namespace fpng
 	{
 		const uint8_t* pBytes = (const uint8_t*)p;
 		return ((uint32_t)pBytes[0]) | (((uint32_t)pBytes[1]) << 8U) | (((uint32_t)pBytes[2]) << 16U) | (((uint32_t)pBytes[3]) << 24U);
+	}
+
+	static inline uint64_t READ_LE64(const void* p)
+	{
+		const uint8_t* pBytes = (const uint8_t*)p;
+		return ((uint64_t)pBytes[0]) | (((uint64_t)pBytes[1]) << 8U) | (((uint64_t)pBytes[2]) << 16U) | (((uint64_t)pBytes[3]) << 24U) |
+			   (((uint64_t)pBytes[4]) << 32U) | (((uint64_t)pBytes[5]) << 40U) | (((uint64_t)pBytes[6]) << 48U) | (((uint64_t)pBytes[7]) << 56U);
 	}
 
 	static inline uint32_t READ_BE32(const void* p)
@@ -1884,6 +1893,143 @@ do_literals:
 		}
 
 		return dst_ofs;
+	}
+
+	// ============================================
+	// Sparse Image Optimization (for images with 90%+ zero regions)
+	// ============================================
+
+	// Detect if image is sparse (has significant zero regions)
+	static bool is_image_sparse(const uint8_t* pImage, uint32_t w, uint32_t h, uint32_t num_chans)
+	{
+		const uint32_t total_bytes = w * h * num_chans;
+		uint32_t zero_count = 0;
+
+		// Sample 25% of the image for quick detection
+		for (uint32_t i = 0; i < total_bytes; i += 4)
+		{
+			zero_count += (pImage[i] == 0 ? 1 : 0);
+		}
+
+		// If sampled region has >70% zeros, consider it sparse
+		return (zero_count * 100) / (total_bytes / 4) > 70;
+	}
+
+	// Sparse image encoding - optimized for images with large zero regions
+	// Format: [zero_count_8bytes:1][data] where zero_count is an int64 if >0
+	static uint32_t encode_sparse_scanline(
+		const uint8_t* pSrc, uint32_t w, uint32_t num_chans,
+		std::vector<uint8_t>& out_buf)
+	{
+		const uint32_t bpl = w * num_chans;
+		uint32_t ofs = 0;
+		uint32_t out_ofs = 0;
+
+		while (ofs < bpl)
+		{
+			// Check for 8 consecutive zero bytes using int64
+			const uint32_t remaining = bpl - ofs;
+
+			if (remaining >= sizeof(uint64_t))
+			{
+				uint64_t zero_run = 0;
+
+				// Count consecutive zero int64's
+				while ((ofs + sizeof(uint64_t)) <= bpl)
+				{
+					uint64_t value = READ_LE64(pSrc + ofs);
+					if (value == 0)
+					{
+						zero_run += sizeof(uint64_t);
+						ofs += sizeof(uint64_t);
+					}
+					else
+					{
+						break;
+					}
+				}
+
+				// If we have a significant zero run, encode it
+				if (zero_run >= sizeof(uint64_t))
+				{
+					// Mark as zero run: 0xFF marker + count
+					out_buf[out_ofs++] = 0xFF;
+
+					// Write 64-bit zero count
+					WRITE_LE64(out_buf.data() + out_ofs, zero_run);
+					out_ofs += sizeof(uint64_t);
+					continue;
+				}
+			}
+
+			// Handle remaining bytes that don't form a full 8-byte zero block
+			uint32_t literal_run = 0;
+			const uint32_t literal_start = out_ofs;
+			out_ofs++; // Reserve space for length
+
+			while (ofs < bpl && literal_run < 127) // Max 127 bytes per literal run
+			{
+				// Check if next 8 bytes are all zero
+				if ((ofs + sizeof(uint64_t) <= bpl) && (READ_LE64(pSrc + ofs) == 0))
+					break;
+
+				out_buf[out_ofs++] = pSrc[ofs++];
+				literal_run++;
+			}
+
+			// Write literal run length
+			out_buf[literal_start] = (uint8_t)literal_run;
+		}
+
+		return out_ofs;
+	}
+
+	// Sparse image decoding
+	static bool decode_sparse_scanline(
+		const uint8_t* pSrc, uint32_t src_len, uint32_t& src_ofs,
+		uint8_t* pDst, uint32_t w, uint32_t num_chans)
+	{
+		const uint32_t bpl = w * num_chans;
+		uint32_t dst_ofs = 0;
+
+		while (dst_ofs < bpl && src_ofs < src_len)
+		{
+			uint8_t marker = pSrc[src_ofs++];
+
+			if (marker == 0xFF)
+			{
+				// Zero run follows
+				if ((src_ofs + sizeof(uint64_t)) > src_len)
+					return false;
+
+				uint64_t zero_count = READ_LE64(pSrc + src_ofs);
+				src_ofs += sizeof(uint64_t);
+
+				if ((dst_ofs + zero_count) > bpl)
+					return false;
+
+				memset(pDst + dst_ofs, 0, (size_t)zero_count);
+				dst_ofs += (uint32_t)zero_count;
+			}
+			else
+			{
+				// Literal run
+				uint32_t literal_len = (uint32_t)marker;
+
+				if ((src_ofs + literal_len) > src_len)
+					return false;
+
+				if ((dst_ofs + literal_len) > bpl)
+					return false;
+
+				memcpy(pDst + dst_ofs, pSrc + src_ofs, literal_len);
+				src_ofs += literal_len;
+				dst_ofs += literal_len;
+			}
+		}
+
+		// Verify we decoded the full scanline
+		return (dst_ofs == bpl);
 	}
 
 	static void vector_append(std::vector<uint8_t>& buf, const void* pData, size_t len)

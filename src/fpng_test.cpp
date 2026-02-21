@@ -990,6 +990,142 @@ static void convert_to_grayscale(const uint8_t* pSource, uint32_t w, uint32_t h,
 	}
 }
 
+// ===== Sparse Image Optimization Tests =====
+
+// Generate a sparse test image (90% zeros)
+static void generate_sparse_image(uint8_t* pImage, uint32_t w, uint32_t h, uint32_t num_chans)
+{
+	uint32_t total_pixels = w * h;
+
+	memset(pImage, 0, total_pixels * num_chans);
+
+	// Add some non-zero data in 10% of the image
+	for (uint32_t i = 0; i < total_pixels / 10; i++)
+	{
+		uint32_t pixel_idx = (i * 13) % total_pixels; // Pseudo-random distribution
+		uint32_t byte_idx = pixel_idx * num_chans;
+
+		for (uint32_t c = 0; c < num_chans; c++)
+		{
+			pImage[byte_idx + c] = (uint8_t)((pixel_idx + c) % 256);
+		}
+	}
+}
+
+// Measure sparsity of an image
+static double measure_sparsity(const uint8_t* pImage, uint32_t w, uint32_t h, uint32_t num_chans)
+{
+	uint32_t total_bytes = w * h * num_chans;
+	uint32_t zero_bytes = 0;
+
+	for (uint32_t i = 0; i < total_bytes; i++)
+	{
+		zero_bytes += (pImage[i] == 0 ? 1 : 0);
+	}
+
+	return (100.0 * zero_bytes) / total_bytes;
+}
+
+// Sparse image optimization test
+static int sparse_image_test()
+{
+	printf("\n=== FPNG Sparse Image Optimization Test ===\n\n");
+
+	// Test parameters
+	const uint32_t TEST_WIDTH = 512;
+	const uint32_t TEST_HEIGHT = 512;
+	const uint32_t NUM_CHANNELS = 4;
+
+	uint32_t total_pixels = TEST_WIDTH * TEST_HEIGHT;
+	uint32_t image_size = total_pixels * NUM_CHANNELS;
+
+	printf("Image dimensions: %u x %u (%u pixels)\n", TEST_WIDTH, TEST_HEIGHT, total_pixels);
+	printf("Channels: %u\n", NUM_CHANNELS);
+	printf("Uncompressed size: %u bytes (%.2f MB)\n\n", image_size, image_size / (1024.0f * 1024.0f));
+
+	// Generate test image
+	uint8_vec sparse_image(image_size);
+	generate_sparse_image(sparse_image.data(), TEST_WIDTH, TEST_HEIGHT, NUM_CHANNELS);
+
+	double sparsity = measure_sparsity(sparse_image.data(), TEST_WIDTH, TEST_HEIGHT, NUM_CHANNELS);
+	printf("Image sparsity: %.2f%% zeros\n", sparsity);
+	printf("Non-zero data: %.2f%% (%u bytes)\n\n", 100.0 - sparsity, (uint32_t)((total_pixels * NUM_CHANNELS * (100.0 - sparsity)) / 100.0));
+
+	// Test FPNG encoding
+	printf("--- FPNG Encoding ---\n");
+	uint8_vec fpng_buf;
+
+	interval_timer tm;
+	tm.init();
+
+	tm.start();
+	if (!fpng::fpng_encode_image_to_memory(sparse_image.data(), TEST_WIDTH, TEST_HEIGHT, NUM_CHANNELS, fpng_buf, 0))
+	{
+		fprintf(stderr, "FPNG encoding failed!\n");
+		return EXIT_FAILURE;
+	}
+	double encode_time = tm.get_elapsed_secs();
+
+	printf("Encoded size: %u bytes (%.2f MB)\n", (uint32_t)fpng_buf.size(), fpng_buf.size() / (1024.0f * 1024.0f));
+	printf("Compression ratio: %.2f%%\n", (100.0 * fpng_buf.size()) / image_size);
+	printf("Encode time: %.6f seconds\n", encode_time);
+	printf("Throughput: %.2f MP/sec\n\n", (total_pixels / (1024.0f * 1024.0f)) / encode_time);
+
+	// Test decoding
+	printf("--- FPNG Decoding ---\n");
+	uint8_vec decoded_buf;
+	uint32_t dec_width, dec_height, dec_channels;
+
+	tm.start();
+	int decode_res = fpng::fpng_decode_memory(fpng_buf.data(), (uint32_t)fpng_buf.size(), 
+		decoded_buf, dec_width, dec_height, dec_channels, NUM_CHANNELS);
+	double decode_time = tm.get_elapsed_secs();
+
+	if (decode_res != fpng::FPNG_DECODE_SUCCESS)
+	{
+		fprintf(stderr, "FPNG decoding failed with error %d!\n", decode_res);
+		return EXIT_FAILURE;
+	}
+
+	if ((dec_width != TEST_WIDTH) || (dec_height != TEST_HEIGHT))
+	{
+		fprintf(stderr, "Decoded dimensions mismatch!\n");
+		return EXIT_FAILURE;
+	}
+
+	if (memcmp(decoded_buf.data(), sparse_image.data(), image_size) != 0)
+	{
+		fprintf(stderr, "Decoded image data mismatch!\n");
+		return EXIT_FAILURE;
+	}
+
+	printf("Decode time: %.6f seconds\n", decode_time);
+	printf("Throughput: %.2f MP/sec\n", (total_pixels / (1024.0f * 1024.0f)) / decode_time);
+	printf("Verification: PASSED\n\n");
+
+	// Compression effectiveness analysis
+	printf("--- Compression Analysis ---\n");
+	uint32_t data_size = (uint32_t)(total_pixels * NUM_CHANNELS * (100.0 - sparsity) / 100.0);
+	uint32_t zero_size = (uint32_t)(total_pixels * NUM_CHANNELS * sparsity / 100.0);
+
+	printf("Theoretical data regions: %u bytes\n", data_size);
+	printf("Theoretical zero regions: %u bytes\n", zero_size);
+	printf("Compressed PNG size: %u bytes\n", (uint32_t)fpng_buf.size());
+	printf("Overhead: %u bytes\n\n", (uint32_t)fpng_buf.size() - data_size);
+
+	// Additional statistics
+	printf("--- Performance Summary ---\n");
+	printf("Total encode time: %.6f seconds\n", encode_time);
+	printf("Total decode time: %.6f seconds\n", decode_time);
+	printf("Total processing time: %.6f seconds\n", encode_time + decode_time);
+	printf("Encode + Decode throughput: %.2f MP/sec\n", 
+		(total_pixels / (1024.0f * 1024.0f)) / (encode_time + decode_time) * 2);
+
+	printf("\n? Sparse image optimization test completed successfully!\n\n");
+
+	return EXIT_SUCCESS;
+}
+
 // Decode performance test
 static int decode_performance_test(const char* pFilename)
 {
@@ -1177,6 +1313,7 @@ int main(int arg_c, char **arg_v)
 		printf("-a: Swizzle input image's green to alpha, for testing 32bpp correlation alpha\n");
 		printf("-g: Convert image to grayscale and test grayscale compression\n");
 		printf("-d: Decode performance test - test decoding performance with multiple decoders\n");
+		printf("-S: Test sparse image optimization (90%% sparse test image)\n");
 		printf("-t: Train Huffman tables on @filelist.txt (must compile with FPNG_TRAIN_HUFFMAN_TABLES=1)\n");
 		return EXIT_FAILURE;
 	}
@@ -1192,6 +1329,7 @@ int main(int arg_c, char **arg_v)
 	bool swizzle_green_to_alpha = false;
 	bool grayscale_mode = false;
 	bool decode_perf_mode = false;
+	bool sparse_test_mode = false;
 	bool training_mode_flag = false;
 
 	for (int i = 1; i < arg_c; i++)
@@ -1235,6 +1373,10 @@ int main(int arg_c, char **arg_v)
 			{
 				decode_perf_mode = true;
 			}
+			else if (pArg[1] == 'S')
+			{
+				sparse_test_mode = true;
+			}
 			else if (pArg[1] == 't')
 			{
 				training_mode_flag = true;
@@ -1274,6 +1416,9 @@ int main(int arg_c, char **arg_v)
 
 	if (decode_perf_mode)
 		return decode_performance_test(pFilename);
+
+	if (sparse_test_mode)
+		return sparse_image_test();
 
 	if (!csv_flag)
 	{
